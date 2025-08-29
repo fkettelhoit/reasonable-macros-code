@@ -2,10 +2,10 @@ use std::{cmp::max, mem};
 
 #[derive(Debug, Clone)]
 pub enum Ast {
-    Var(&'static str),
     Str(&'static str),
-    Binding(usize, &'static str),
-    Macro(usize, &'static str),
+    Var(&'static str),
+    Pinned(&'static str),
+    Binding(&'static str),
     Block(Vec<Ast>),
     Call(Box<Ast>, Vec<Ast>),
 }
@@ -60,63 +60,96 @@ fn resolve_var(v: &str, ctx: &Ctx) -> Option<usize> {
     ctx.vars.iter().rev().position(|(_, x)| *x == v)
 }
 
-fn is_macro(ast: &Ast, ctx: &Ctx) -> bool {
-    if let Ast::Var(v) = ast {
-        if let Some((true, _)) = ctx.vars.iter().rev().find(|(_, x)| x == v) {
-            return true;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroType {
+    Inline,
+    Enclosing,
+}
+
+fn macro_type(args: &[Ast]) -> Option<MacroType> {
+    if args.iter().any(|x| matches!(x, Ast::Block(_))) {
+        Some(MacroType::Inline)
+    } else if args.iter().any(|x| has_bindings(MacroType::Enclosing, x)) {
+        Some(MacroType::Enclosing)
+    } else {
+        None
+    }
+}
+
+fn has_bindings(ty: MacroType, ast: &Ast) -> bool {
+    match ast {
+        Ast::Binding(_) => true,
+        Ast::Var(_) if ty == MacroType::Inline => true,
+        Ast::Str(_) | Ast::Var(_) | Ast::Pinned(_) | Ast::Block(_) => false,
+        Ast::Call(f, _) if has_bindings(ty, f) => true,
+        Ast::Call(_, args) => args.iter().any(|arg| has_bindings(ty, arg)),
+    }
+}
+
+fn desugar_builtin(ty: MacroType, ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
+    match ast {
+        Ast::Var(v) if ty == MacroType::Inline => {
+            println!("inline var {v}");
+            ctx.bindings.push((0, false, v));
+            desugar(Ast::Binding(v), ctx)
         }
-    }
-    false
-}
-
-fn has_bindings(ast: &Ast, ctx: &Ctx) -> bool {
-    match ast {
-        Ast::Binding(_, _) | Ast::Macro(_, _) => true,
-        Ast::Var(_) | Ast::Str(_) | Ast::Block(_) => false,
-        Ast::Call(f, _) if is_macro(f, ctx) => false,
-        Ast::Call(f, _) if has_bindings(f, ctx) => true,
-        Ast::Call(_, args) => args.iter().any(|arg| has_bindings(arg, ctx)),
+        Ast::Pinned(v) => match ty {
+            MacroType::Inline => desugar(Ast::Var(v), ctx),
+            MacroType::Enclosing => Err(v),
+        },
+        Ast::Binding(v) => {
+            ctx.bindings.push((0, false, v));
+            desugar(ast, ctx)
+        }
+        _ => desugar(ast, ctx),
     }
 }
 
-fn desugar_macro(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
-    fn desug_all(xs: Vec<Ast>, ctx: &mut Ctx) -> Result<Vec<Expr>, &'static str> {
-        xs.into_iter().map(|x| desugar_macro(x, ctx)).collect()
+fn desugar_macro(ty: MacroType, ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
+    fn desug_all(ty: MacroType, xs: Vec<Ast>, ctx: &mut Ctx) -> Result<Vec<Expr>, &'static str> {
+        xs.into_iter().map(|x| desugar_macro(ty, x, ctx)).collect()
     }
     match ast {
-        Ast::Call(f, args) if has_bindings(&ast, ctx) => {
-            let f = desugar_macro(*f, ctx)?;
-            let args = desug_all(args, ctx)?;
+        Ast::Call(f, args) if has_bindings(ty, &ast) => {
+            let f = desugar_macro(ty, *f, ctx)?;
+            let args = desug_all(ty, args, ctx)?;
             let list = args.into_iter().fold(Expr::Str("Nil"), |l, x| app(l, x));
             Ok(app(app(Expr::Str("Call"), f), list))
         }
-        Ast::Var(_) | Ast::Str(_) | Ast::Call(_, _) => {
-            Ok(app(Expr::Str("Value"), desugar(ast, ctx)?))
+        Ast::Var(v) => match ty {
+            MacroType::Inline => {
+                println!("inline var {v}");
+                ctx.bindings.push((0, false, v));
+                Ok(app(Expr::Str("Binding"), desugar(Ast::Binding(v), ctx)?))
+            }
+            MacroType::Enclosing => Ok(app(Expr::Str("Value"), desugar(ast, ctx)?)),
+        },
+        Ast::Pinned(v) => match ty {
+            MacroType::Inline => Ok(app(Expr::Str("Value"), desugar(Ast::Var(v), ctx)?)),
+            MacroType::Enclosing => Err(v),
+        },
+        Ast::Binding(v) => {
+            ctx.bindings.push((0, false, v));
+            Ok(app(Expr::Str("Binding"), desugar(ast, ctx)?))
         }
-        Ast::Binding(_, _) | Ast::Macro(_, _) => Ok(app(Expr::Str("Binding"), desugar(ast, ctx)?)),
+        Ast::Str(_) | Ast::Call(_, _) => Ok(app(Expr::Str("Value"), desugar(ast, ctx)?)),
         Ast::Block(_) => desugar(ast, ctx),
     }
 }
 
 pub fn desugar(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
     match ast {
+        Ast::Str(s) => Ok(Expr::Str(s)),
         Ast::Var(v) => match resolve_var(&v, ctx) {
             Some(v) => Ok(Expr::Var(v)),
             None => match v {
                 "=" => Ok(abs(abs(abs(app(Expr::Var(0), Expr::Var(1)))))),
                 "=>" => Ok(abs(abs(Expr::Var(0)))),
-                _ => Err(v),
+                _ => panic!("unbound {v}"),
             },
         },
-        Ast::Str(s) => Ok(Expr::Str(s)),
-        Ast::Binding(lvl, name) => {
-            ctx.bindings.push((lvl, false, name));
-            Ok(Expr::Str(name))
-        }
-        Ast::Macro(lvl, name) => {
-            ctx.bindings.push((lvl, true, name));
-            Ok(Expr::Str(name))
-        }
+        Ast::Pinned(v) => Err(v),
+        Ast::Binding(name) => Ok(Expr::Str(name)),
         Ast::Block(mut items) => {
             let mut desugared = vec![];
             if items.is_empty() {
@@ -145,13 +178,20 @@ pub fn desugar(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
         }
         Ast::Call(f, args) => {
             let bindings = mem::replace(&mut ctx.bindings, vec![]);
-            let is_macro = is_macro(&f, ctx);
             let mut f = desugar(*f, ctx)?;
+            let is_builtin = matches!(f, Expr::Abs(_));
+            let macro_type = macro_type(&args);
+            println!("{f:?}(\n  {args:?}\n) -> {macro_type:?}");
             if args.is_empty() {
                 f = app(f, Expr::Str("Nil"));
             }
             for x in args {
-                f = app(f, if is_macro { desugar_macro(x, ctx)? } else { desugar(x, ctx)? })
+                f = match (macro_type, is_builtin) {
+                    (None, _) => app(f, desugar(x, ctx)?),
+                    (Some(ty), true) => app(f, desugar_builtin(ty, x, ctx)?),
+                    (Some(ty), false) => app(f, desugar_macro(ty, x, ctx)?),
+                };
+                println!("--> {f:?}");
             }
             ctx.bindings.splice(0..0, bindings);
             Ok(f)
@@ -165,10 +205,10 @@ mod tests {
 
     #[test]
     fn lambda_app() {
-        // (:x => { f(x) })("foo")
+        // (x => { f(x) })("foo")
 
         let block = Ast::Block(vec![Ast::Call(Ast::Var("f").into(), vec![Ast::Var("x")])]);
-        let lambda = Ast::Call(Ast::Var("=>").into(), vec![Ast::Binding(0, "x"), block]);
+        let lambda = Ast::Call(Ast::Var("=>").into(), vec![Ast::Var("x"), block]);
         let foo = Ast::Str("foo");
         let ast = Ast::Call(lambda.into(), vec![foo]);
 
@@ -184,12 +224,12 @@ mod tests {
 
     #[test]
     fn let_var_in_inner() {
-        // { :x = "foo", let(:y, x, { f(y) }) }
-        let x_eq_foo = Ast::Call(Ast::Var("=").into(), vec![Ast::Binding(0, "x"), Ast::Str("foo")]);
+        // { :x = "foo", let(y, ^x, { f(y) }) }
+        let x_eq_foo = Ast::Call(Ast::Var("=").into(), vec![Ast::Binding("x"), Ast::Str("foo")]);
         let f_y = Ast::Call(Ast::Var("f").into(), vec![Ast::Var("y")]);
         let let_y_x_block = Ast::Call(
             Ast::Var("let").into(),
-            vec![Ast::Binding(0, "y"), Ast::Var("x"), Ast::Block(vec![f_y])],
+            vec![Ast::Var("y"), Ast::Pinned("x"), Ast::Block(vec![f_y])],
         );
 
         let ast = Ast::Block(vec![x_eq_foo, let_y_x_block]);
@@ -218,8 +258,8 @@ mod tests {
     fn let_var_in_outer() {
         // { :x = "foo", let(:y, x), f(y) }
 
-        let x_eq_foo = Ast::Call(Ast::Var("=").into(), vec![Ast::Binding(0, "x"), Ast::Str("foo")]);
-        let let_y_x = Ast::Call(Ast::Var("let").into(), vec![Ast::Binding(0, "y"), Ast::Var("x")]);
+        let x_eq_foo = Ast::Call(Ast::Var("=").into(), vec![Ast::Binding("x"), Ast::Str("foo")]);
+        let let_y_x = Ast::Call(Ast::Var("let").into(), vec![Ast::Binding("y"), Ast::Var("x")]);
         let f_y = Ast::Call(Ast::Var("f").into(), vec![Ast::Var("y")]);
 
         let ast = Ast::Block(vec![x_eq_foo, let_y_x, f_y]);
@@ -248,8 +288,8 @@ mod tests {
     fn let_var_in_outer_then_side_effects() {
         // { :x = "foo", let(:y, x), f(y), g(x) }
 
-        let x_eq_foo = Ast::Call(Ast::Var("=").into(), vec![Ast::Binding(0, "x"), Ast::Str("foo")]);
-        let let_y_x = Ast::Call(Ast::Var("let").into(), vec![Ast::Binding(0, "y"), Ast::Var("x")]);
+        let x_eq_foo = Ast::Call(Ast::Var("=").into(), vec![Ast::Binding("x"), Ast::Str("foo")]);
+        let let_y_x = Ast::Call(Ast::Var("let").into(), vec![Ast::Binding("y"), Ast::Var("x")]);
         let f_y = Ast::Call(Ast::Var("f").into(), vec![Ast::Var("y")]);
         let g_x = Ast::Call(Ast::Var("g").into(), vec![Ast::Var("x")]);
 
@@ -282,9 +322,9 @@ mod tests {
 
     #[test]
     fn recursive_fn() {
-        // { ::f(:x) = { f(x) }, f("foo") }
+        // { :f(x) = { f(x) }, f("foo") }
 
-        let f_x_signature = Ast::Call(Ast::Binding(1, "f").into(), vec![Ast::Binding(0, "x")]);
+        let f_x_signature = Ast::Call(Ast::Binding("f").into(), vec![Ast::Var("x")]);
         let f_x_body =
             Ast::Block(vec![Ast::Call(Ast::Var("f").into(), vec![Ast::Var("x").into()])]);
         let rec_f_x = Ast::Call(Ast::Var("=").into(), vec![f_x_signature, f_x_body]);
