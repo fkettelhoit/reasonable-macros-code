@@ -279,4 +279,26 @@ mod tests {
         let result = desugar(ast, &mut ctx).unwrap();
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn recursive_fn() {
+        // { ::f(:x) = { f(x) }, f("foo") }
+
+        let f_x_signature = Ast::Call(Ast::Binding(1, "f").into(), vec![Ast::Binding(0, "x")]);
+        let f_x_body =
+            Ast::Block(vec![Ast::Call(Ast::Var("f").into(), vec![Ast::Var("x").into()])]);
+        let rec_f_x = Ast::Call(Ast::Var("=").into(), vec![f_x_signature, f_x_body]);
+        let f_foo = Ast::Call(Ast::Var("f").into(), vec![Ast::Str("foo")]);
+
+        let ast = Ast::Block(vec![rec_f_x, f_foo]);
+
+        let eq = abs(abs(abs(app(Expr::Var(0), Expr::Var(1)))));
+        let f_x_signature = app(Expr::Str("f"), Expr::Str("x"));
+        let f_x_body = abs(abs(app(Expr::Var(1), Expr::Var(0))));
+        let f_foo = app(Expr::Var(0), Expr::Str("foo"));
+        let expected = abs(app(app(app(eq, f_x_signature), f_x_body), abs(f_foo)));
+
+        let mut ctx = Ctx::default();
+        assert_eq!(desugar(ast, &mut ctx).unwrap(), expected);
+    }
 }
