@@ -142,7 +142,7 @@ pub fn desugar(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
             None => match v {
                 "=" => Ok(abs(abs(abs(app(Expr::Var(0), Expr::Var(1)))))),
                 "=>" => Ok(abs(abs(Expr::Var(0)))),
-                _ => panic!("unbound {v}"),
+                _ => Err(v),
             },
         },
         Ast::Pinned(v) => Err(v),
