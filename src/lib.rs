@@ -1,4 +1,4 @@
-use std::{cmp::max, mem};
+use std::vec::IntoIter;
 
 #[derive(Debug, Clone)]
 pub enum Ast {
@@ -12,32 +12,9 @@ pub enum Ast {
 
 #[derive(Debug, Clone, Default)]
 pub struct Ctx {
-    pub bindings: Vec<(usize, bool, &'static str)>, // bool: true for macro, false for binding
-    pub vars: Vec<(bool, &'static str)>,
-}
-
-impl Ctx {
-    pub fn drain_bindings(&mut self) -> Vec<(bool, &'static str)> {
-        let mut kept = vec![];
-        let mut drained = vec![];
-        for (lvl, is_macro, name) in self.bindings.drain(..) {
-            if lvl > 0 {
-                kept.push((lvl, is_macro, name));
-            }
-            drained.push((is_macro, name));
-        }
-        self.bindings = kept;
-        drained
-    }
-
-    pub fn clear_bindings(&mut self) {
-        self.bindings = self
-            .bindings
-            .drain(..)
-            .filter(|(lvl, _, _)| *lvl > 0)
-            .map(|(lvl, is_macro, name)| (lvl - 1, is_macro, name))
-            .collect()
-    }
+    pub active_bindings: Vec<&'static str>,
+    pub all_bindings: Vec<&'static str>,
+    pub vars: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +34,7 @@ pub fn app(f: Expr, arg: Expr) -> Expr {
 }
 
 fn resolve_var(v: &str, ctx: &Ctx) -> Option<usize> {
-    ctx.vars.iter().rev().position(|(_, x)| *x == v)
+    ctx.vars.iter().rev().position(|x| *x == v)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +66,7 @@ fn has_bindings(ty: MacroType, ast: &Ast) -> bool {
 fn desugar_builtin(ty: MacroType, ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
     match ast {
         Ast::Var(v) if ty == MacroType::Inline => {
-            println!("inline var {v}");
-            ctx.bindings.push((0, false, v));
+            ctx.active_bindings.push(v);
             desugar(Ast::Binding(v), ctx)
         }
         Ast::Pinned(v) => match ty {
@@ -98,7 +74,10 @@ fn desugar_builtin(ty: MacroType, ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'sta
             MacroType::Enclosing => Err(v),
         },
         Ast::Binding(v) => {
-            ctx.bindings.push((0, false, v));
+            if ty == MacroType::Inline {
+                ctx.all_bindings.push(v);
+            }
+            ctx.active_bindings.push(v);
             desugar(ast, ctx)
         }
         _ => desugar(ast, ctx),
@@ -118,8 +97,7 @@ fn desugar_macro(ty: MacroType, ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'stati
         }
         Ast::Var(v) => match ty {
             MacroType::Inline => {
-                println!("inline var {v}");
-                ctx.bindings.push((0, false, v));
+                ctx.active_bindings.push(v);
                 Ok(app(Expr::Str("Binding"), desugar(Ast::Binding(v), ctx)?))
             }
             MacroType::Enclosing => Ok(app(Expr::Str("Value"), desugar(ast, ctx)?)),
@@ -129,12 +107,31 @@ fn desugar_macro(ty: MacroType, ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'stati
             MacroType::Enclosing => Err(v),
         },
         Ast::Binding(v) => {
-            ctx.bindings.push((0, false, v));
+            if ty == MacroType::Inline {
+                ctx.all_bindings.push(v);
+            }
+            ctx.active_bindings.push(v);
             Ok(app(Expr::Str("Binding"), desugar(ast, ctx)?))
         }
         Ast::Str(_) | Ast::Call(_, _) => Ok(app(Expr::Str("Value"), desugar(ast, ctx)?)),
         Ast::Block(_) => desugar(ast, ctx),
     }
+}
+
+fn desugar_item(x: Ast, mut xs: IntoIter<Ast>, ctx: &mut Ctx) -> Result<Expr, &'static str> {
+    if ctx.active_bindings.is_empty() {
+        ctx.active_bindings.push("");
+    }
+    let bindings = ctx.active_bindings.len();
+    ctx.vars.extend(ctx.active_bindings.drain(..));
+    let mut x = desugar(x, ctx)?;
+    if let Some(y) = xs.next() {
+        let side_effect = ctx.active_bindings.is_empty();
+        let y = desugar_item(y, xs, ctx)?;
+        x = if side_effect { app(y, x) } else { app(x, y) }
+    }
+    ctx.vars.truncate(ctx.vars.len() - bindings);
+    Ok((0..bindings).fold(x, |x, _| abs(x)))
 }
 
 pub fn desugar(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
@@ -150,38 +147,17 @@ pub fn desugar(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
         },
         Ast::Pinned(v) => Err(v),
         Ast::Binding(name) => Ok(Expr::Str(name)),
-        Ast::Block(mut items) => {
-            let mut desugared = vec![];
-            if items.is_empty() {
-                items.push(Ast::Str("Nil"));
-            }
-            for ast in items {
-                let bindings = ctx.bindings.len();
-                let drained = ctx.drain_bindings();
-                ctx.vars.extend(drained);
-                if bindings == 0 {
-                    ctx.vars.push((false, ""))
-                }
-                desugared.push((bindings, desugar(ast, ctx)?));
-            }
-            let (mut bindings, mut expr) = desugared.pop().unwrap();
-            expr = (0..max(1, bindings)).fold(expr, |x, _| abs(x));
-            for (prev_bindings, x) in desugared.into_iter().rev() {
-                let (f, arg) = if bindings == 0 { (expr, x) } else { (x, expr) };
-                expr = (0..max(1, prev_bindings)).fold(app(f, arg), |x, _| abs(x));
-                ctx.vars.truncate(ctx.vars.len() - max(1, bindings));
-                bindings = prev_bindings;
-            }
-            ctx.vars.truncate(ctx.vars.len() - max(1, bindings));
-            ctx.clear_bindings();
-            Ok(expr)
+        Ast::Block(items) => {
+            let mut xs = items.into_iter();
+            desugar_item(xs.next().unwrap_or(Ast::Str("Nil")), xs, ctx)
         }
         Ast::Call(f, args) => {
-            let bindings = mem::replace(&mut ctx.bindings, vec![]);
             let mut f = desugar(*f, ctx)?;
             let is_builtin = matches!(f, Expr::Abs(_));
             let macro_type = macro_type(&args);
-            println!("{f:?}(\n  {args:?}\n) -> {macro_type:?}");
+            if let Some(MacroType::Inline) = macro_type {
+                ctx.all_bindings = ctx.active_bindings.clone();
+            }
             if args.is_empty() {
                 f = app(f, Expr::Str("Nil"));
             }
@@ -190,10 +166,11 @@ pub fn desugar(ast: Ast, ctx: &mut Ctx) -> Result<Expr, &'static str> {
                     (None, _) => app(f, desugar(x, ctx)?),
                     (Some(ty), true) => app(f, desugar_builtin(ty, x, ctx)?),
                     (Some(ty), false) => app(f, desugar_macro(ty, x, ctx)?),
-                };
-                println!("--> {f:?}");
+                }
             }
-            ctx.bindings.splice(0..0, bindings);
+            if let Some(MacroType::Inline) = macro_type {
+                ctx.active_bindings = ctx.all_bindings.drain(..).collect();
+            }
             Ok(f)
         }
     }
@@ -218,7 +195,7 @@ mod tests {
         let expected = app(lambda, Expr::Str("foo"));
 
         let mut ctx = Ctx::default();
-        ctx.vars.push((false, "f"));
+        ctx.vars.push("f");
         assert_eq!(desugar(ast, &mut ctx).unwrap(), expected);
     }
 
@@ -247,8 +224,8 @@ mod tests {
         let expected = abs(app(x_eq_foo, abs(app(let_y_x, abs(f_y)))));
 
         let mut ctx = Ctx::default();
-        ctx.vars.push((true, "let")); // let is a macro
-        ctx.vars.push((false, "f"));
+        ctx.vars.push("let");
+        ctx.vars.push("f");
 
         let result = desugar(ast, &mut ctx).unwrap();
         assert_eq!(result, expected);
@@ -277,8 +254,8 @@ mod tests {
         let expected = abs(app(x_eq_foo, abs(app(let_y_x, abs(f_y)))));
 
         let mut ctx = Ctx::default();
-        ctx.vars.push((true, "let")); // let is a macro
-        ctx.vars.push((false, "f"));
+        ctx.vars.push("let");
+        ctx.vars.push("f");
 
         let result = desugar(ast, &mut ctx).unwrap();
         assert_eq!(result, expected);
@@ -312,9 +289,9 @@ mod tests {
         let expected = abs(app(x_eq_foo, abs(app(let_y_x, f_y_then_g_x))));
 
         let mut ctx = Ctx::default();
-        ctx.vars.push((true, "let")); // let is a macro
-        ctx.vars.push((false, "f"));
-        ctx.vars.push((false, "g"));
+        ctx.vars.push("let");
+        ctx.vars.push("f");
+        ctx.vars.push("g");
 
         let result = desugar(ast, &mut ctx).unwrap();
         assert_eq!(result, expected);
@@ -322,23 +299,26 @@ mod tests {
 
     #[test]
     fn recursive_fn() {
-        // { :f(x) = { f(x) }, f("foo") }
+        // { def(:f(x), { f(x) }), f("foo") }
 
         let f_x_signature = Ast::Call(Ast::Binding("f").into(), vec![Ast::Var("x")]);
         let f_x_body =
             Ast::Block(vec![Ast::Call(Ast::Var("f").into(), vec![Ast::Var("x").into()])]);
-        let rec_f_x = Ast::Call(Ast::Var("=").into(), vec![f_x_signature, f_x_body]);
+        let def_f_x = Ast::Call(Ast::Var("def").into(), vec![f_x_signature, f_x_body]);
         let f_foo = Ast::Call(Ast::Var("f").into(), vec![Ast::Str("foo")]);
 
-        let ast = Ast::Block(vec![rec_f_x, f_foo]);
+        let ast = Ast::Block(vec![def_f_x, f_foo]);
 
-        let eq = abs(abs(abs(app(Expr::Var(0), Expr::Var(1)))));
-        let f_x_signature = app(Expr::Str("f"), Expr::Str("x"));
+        let def = Expr::Var(1);
+        let f_args = app(Expr::Str("Nil"), app(Expr::Str("Binding"), Expr::Str("x")));
+        let f_x_signature =
+            app(app(Expr::Str("Call"), app(Expr::Str("Binding"), Expr::Str("f"))), f_args);
         let f_x_body = abs(abs(app(Expr::Var(1), Expr::Var(0))));
         let f_foo = app(Expr::Var(0), Expr::Str("foo"));
-        let expected = abs(app(app(app(eq, f_x_signature), f_x_body), abs(f_foo)));
+        let expected = abs(app(app(app(def, f_x_signature), f_x_body), abs(f_foo)));
 
         let mut ctx = Ctx::default();
+        ctx.vars.push("def");
         assert_eq!(desugar(ast, &mut ctx).unwrap(), expected);
     }
 }
